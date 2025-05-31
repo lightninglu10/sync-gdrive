@@ -1,12 +1,28 @@
-#! /usr/bin/env node
+#!/usr/bin/env node
 /* eslint-disable no-console */
 import fs from "fs";
 import cliProgress from "cli-progress";
-import syncGDrive, { IKeyConfig, IOptions } from "./";
+import { syncGDrive, syncFromTo } from "./";
+import path from "path";
 
-interface CliOptions extends IOptions {
+interface CliOptions {
   help?: boolean;
-  noProgress?: boolean;
+  verbose?: boolean;
+  docsFileType?: string;
+  sheetsFileType?: string;
+  slidesFileType?: string;
+  mapsFileType?: string;
+  concurrency?: number;
+  batchSize?: number;
+  sleepTime?: number;
+  forceDownload?: boolean;
+  skipExisting?: boolean;
+  checkSizeAndTime?: boolean;
+  createFolders?: boolean;
+  preserveTimestamps?: boolean;
+  showProgress?: boolean;
+  abortOnError?: boolean;
+  progressCallback?: (progress: any) => void;
 }
 
 // Progress bar setup
@@ -100,222 +116,308 @@ function updateProgressBar(progress: any) {
   }
 }
 
-function printHelp() {
+function showHelp() {
   console.log(`
-📁 sync-gdrive - Fast parallel Google Drive synchronization with incremental sync
+🚀 sync-gdrive - High-performance Google Drive sync tool
 
-Usage: sync-gdrive <drive_file_folder_id> <dest_path> [options]
+USAGE:
+  sync-gdrive --from <source> --to <destination> [options]
 
-Environment Variables:
-  GOOGLE_CLIENT_EMAIL    Your Google service account email
-  GOOGLE_PRIVATE_KEY     Your Google service account private key
+SYNC DIRECTIONS:
+  📥 Download: --from <google-drive-id> --to <local-path>
+  📤 Upload:   --from <local-path> --to <google-drive-id>
 
-Performance Options:
-  --concurrency <num>    Number of parallel downloads (default: 10)
-  --batch-size <num>     Files processed per batch (default: 20)
-  --sleep-time <ms>      Delay between operations in ms (default: 0)
+GOOGLE DRIVE ID FORMATS:
+  New (recommended): gdrive:1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms
+  Legacy (still works): 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms
 
-Incremental Sync Options:
-  --force-download       Re-download all files even if they exist locally
-  --skip-existing        Skip all files that exist locally (no time check)
-  --check-size-and-time  Enhanced checking: skip if size AND time match exactly
+EXAMPLES:
+  # Download from Google Drive to local folder (new format)
+  sync-gdrive --from gdrive:1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms --to ./my-folder
 
-File Type Options:
-  --docs-type <ext>      Google Docs export format (default: docx)
-  --sheets-type <ext>    Google Sheets export format (default: xlsx)
-  --slides-type <ext>    Google Slides export format (default: pptx)
-  --maps-type <ext>      Google Maps export format (default: kml)
-  --fallback-type <ext>  Fallback GSuite export format (default: pdf)
+  # Upload local folder to Google Drive (new format)
+  sync-gdrive --from ./my-folder --to gdrive:1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms
 
-Other Options:
-  --verbose              Enable verbose logging
-  --no-abort-on-error    Continue on errors instead of stopping
-  --no-progress          Disable progress bars
+  # Legacy format still works for backwards compatibility
+  sync-gdrive --from 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms --to ./my-folder
+
+REQUIRED:
+  --from <source>         Source path (Google Drive ID or local path)
+  --to <destination>      Destination path (local path or Google Drive ID)
+
+PERFORMANCE OPTIONS:
+  --concurrency <n>       Parallel downloads/uploads (default: 10)
+  --batch-size <n>        Files per batch (default: 20)  
+  --sleep-time <ms>       Delay between operations (default: 0)
+
+INCREMENTAL SYNC OPTIONS:
+  --force-download        Re-download/upload all files (ignore timestamps)
+  --skip-existing         Skip files that already exist (no timestamp check)
+  --check-size-and-time   Enhanced comparison (size + timestamp matching)
+
+UPLOAD-SPECIFIC OPTIONS:
+  --no-create-folders     Don't create folders in Google Drive
+  --preserve-timestamps   Preserve file modification times (when possible)
+
+FILE TYPE OPTIONS (Downloads):
+  --docs-type <ext>       Google Docs export format (default: docx)
+  --sheets-type <ext>     Google Sheets export format (default: xlsx)
+  --slides-type <ext>     Google Slides export format (default: pptx)
+  --maps-type <ext>       Google Maps export format (default: kml)
+
+UTILITY OPTIONS:
+  --verbose              Show detailed operation logs
+  --no-progress          Disable progress bars (for scripts)
+  --no-abort-on-error    Continue on errors (don't stop)
   --help                 Show this help message
 
-Incremental Sync Behavior:
-  By default, sync-gdrive uses smart incremental sync:
-  • Skips files that exist locally and are newer or same age
-  • Downloads files that don't exist or are older locally
-  • Compares modification times between Google Drive and local files
-  • Perfect for resuming interrupted syncs!
+AUTHENTICATION:
+  Set GOOGLE_APPLICATION_CREDENTIALS environment variable to your service account key file.
 
-Examples:
-  # Smart incremental sync (default) - resumes perfectly
-  sync-gdrive 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs85j4X_VuSqI ./downloads
+RATE LIMIT SAFE COMBINATIONS:
+  🚀 Fast & Safe:      --concurrency 5 --batch-size 10
+  🛡️  Very Safe:       --concurrency 3 --batch-size 8  
+  🐌 Maximum Safety:   --concurrency 2 --batch-size 5
 
-  # Force re-download everything
-  sync-gdrive 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs85j4X_VuSqI ./downloads --force-download
-
-  # Skip existing files completely (fastest for checking)
-  sync-gdrive 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs85j4X_VuSqI ./downloads --skip-existing
-
-  # Enhanced precision checking
-  sync-gdrive 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs85j4X_VuSqI ./downloads --check-size-and-time
-
-  # High performance with progress (shows downloaded vs skipped)
-  sync-gdrive 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs85j4X_VuSqI ./downloads --concurrency 20 --verbose
-
-Progress Bars Show:
-  • Files (↓15 ⊘23) - Downloaded 15, Skipped 23 files
-  • Real-time sync status and speed
-  • Detailed logging in verbose mode shows skip reasons
-
-Rate Limits:
-  Google Drive API allows 200 requests/second per user.
-  Default concurrency (10) uses ~20 requests/second - well within limits.
-  Incremental sync only requests files that need updating!
+For more examples and documentation: https://github.com/your-repo/sync-gdrive
 `);
 }
 
-function parseCliOptions(): {
-  options: CliOptions;
-  fileFolderId?: string;
-  destFolder?: string;
-} {
+function parseArgs() {
   const args = process.argv.slice(2);
-  const options: CliOptions = {};
-  let fileFolderId: string | undefined;
-  let destFolder: string | undefined;
+  const options: CliOptions = {
+    verbose: false,
+    concurrency: 10,
+    batchSize: 20,
+    sleepTime: 0,
+    docsFileType: "docx",
+    sheetsFileType: "xlsx",
+    slidesFileType: "pptx",
+    mapsFileType: "kml",
+    showProgress: true,
+    abortOnError: true,
+    forceDownload: false,
+    skipExisting: false,
+    checkSizeAndTime: false,
+    createFolders: true,
+    preserveTimestamps: false,
+  };
+
+  let fromPath = "";
+  let toPath = "";
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
+    const nextArg = args[i + 1];
 
-    if (arg === "--help" || arg === "-h") {
-      options.help = true;
-    } else if (arg === "--verbose" || arg === "-v") {
-      options.verbose = true;
-    } else if (arg === "--no-abort-on-error") {
-      options.abortOnError = false;
-    } else if (arg === "--no-progress") {
-      options.noProgress = true;
-    } else if (arg === "--concurrency") {
-      const value = parseInt(args[++i], 10);
-      if (isNaN(value) || value < 1) {
-        console.error("❌ Error: --concurrency must be a positive number");
-        process.exit(1);
-      }
-      options.concurrency = value;
-    } else if (arg === "--batch-size") {
-      const value = parseInt(args[++i], 10);
-      if (isNaN(value) || value < 1) {
-        console.error("❌ Error: --batch-size must be a positive number");
-        process.exit(1);
-      }
-      options.batchSize = value;
-    } else if (arg === "--sleep-time") {
-      const value = parseInt(args[++i], 10);
-      if (isNaN(value) || value < 0) {
-        console.error("❌ Error: --sleep-time must be a non-negative number");
-        process.exit(1);
-      }
-      options.sleepTime = value;
-    } else if (arg === "--docs-type") {
-      options.docsFileType = args[++i];
-    } else if (arg === "--sheets-type") {
-      options.sheetsFileType = args[++i];
-    } else if (arg === "--slides-type") {
-      options.slidesFileType = args[++i];
-    } else if (arg === "--maps-type") {
-      options.mapsFileType = args[++i];
-    } else if (arg === "--fallback-type") {
-      options.fallbackGSuiteFileType = args[++i];
-    } else if (arg === "--force-download") {
-      options.forceDownload = true;
-    } else if (arg === "--skip-existing") {
-      options.skipExisting = true;
-    } else if (arg === "--check-size-and-time") {
-      options.checkSizeAndTime = true;
-    } else if (!arg.startsWith("--")) {
-      if (!fileFolderId) {
-        fileFolderId = arg;
-      } else if (!destFolder) {
-        destFolder = arg;
-      } else {
-        console.error(`❌ Error: Unexpected argument '${arg}'`);
-        process.exit(1);
-      }
-    } else {
-      console.error(`❌ Error: Unknown option '${arg}'`);
-      console.log("Use --help for usage information");
-      process.exit(1);
+    switch (arg) {
+      case "--help":
+      case "-h":
+        showHelp();
+        process.exit(0);
+        break;
+
+      case "--from":
+        if (!nextArg) {
+          console.error("❌ Error: --from requires a source path");
+          process.exit(1);
+        }
+        fromPath = nextArg;
+        i++;
+        break;
+
+      case "--to":
+        if (!nextArg) {
+          console.error("❌ Error: --to requires a destination path");
+          process.exit(1);
+        }
+        toPath = nextArg;
+        i++;
+        break;
+
+      case "--verbose":
+        options.verbose = true;
+        break;
+
+      case "--concurrency":
+        if (!nextArg || isNaN(parseInt(nextArg))) {
+          console.error("❌ Error: --concurrency requires a number");
+          process.exit(1);
+        }
+        options.concurrency = parseInt(nextArg);
+        i++;
+        break;
+
+      case "--batch-size":
+        if (!nextArg || isNaN(parseInt(nextArg))) {
+          console.error("❌ Error: --batch-size requires a number");
+          process.exit(1);
+        }
+        options.batchSize = parseInt(nextArg);
+        i++;
+        break;
+
+      case "--sleep-time":
+        if (!nextArg || isNaN(parseInt(nextArg))) {
+          console.error(
+            "❌ Error: --sleep-time requires a number (milliseconds)"
+          );
+          process.exit(1);
+        }
+        options.sleepTime = parseInt(nextArg);
+        i++;
+        break;
+
+      case "--docs-type":
+        if (!nextArg) {
+          console.error("❌ Error: --docs-type requires a file extension");
+          process.exit(1);
+        }
+        options.docsFileType = nextArg;
+        i++;
+        break;
+
+      case "--sheets-type":
+        if (!nextArg) {
+          console.error("❌ Error: --sheets-type requires a file extension");
+          process.exit(1);
+        }
+        options.sheetsFileType = nextArg;
+        i++;
+        break;
+
+      case "--slides-type":
+        if (!nextArg) {
+          console.error("❌ Error: --slides-type requires a file extension");
+          process.exit(1);
+        }
+        options.slidesFileType = nextArg;
+        i++;
+        break;
+
+      case "--maps-type":
+        if (!nextArg) {
+          console.error("❌ Error: --maps-type requires a file extension");
+          process.exit(1);
+        }
+        options.mapsFileType = nextArg;
+        i++;
+        break;
+
+      case "--no-progress":
+        options.showProgress = false;
+        break;
+
+      case "--no-abort-on-error":
+        options.abortOnError = false;
+        break;
+
+      case "--force-download":
+        options.forceDownload = true;
+        break;
+
+      case "--skip-existing":
+        options.skipExisting = true;
+        break;
+
+      case "--check-size-and-time":
+        options.checkSizeAndTime = true;
+        break;
+
+      case "--no-create-folders":
+        options.createFolders = false;
+        break;
+
+      case "--preserve-timestamps":
+        options.preserveTimestamps = true;
+        break;
+
+      default:
+        if (arg.startsWith("--")) {
+          console.error(`❌ Error: Unknown option: ${arg}`);
+          console.log("💡 Use --help to see available options");
+          process.exit(1);
+        }
+        break;
     }
   }
 
-  return { options, fileFolderId, destFolder };
+  return { fromPath, toPath, options };
 }
 
 async function main() {
-  const { options, fileFolderId, destFolder } = parseCliOptions();
-
   try {
-    if (options.help) {
-      printHelp();
-      process.exit(0);
-    }
+    const { fromPath, toPath, options } = parseArgs();
 
-    let okay = true;
-    const clientEmail = process.env.GOOGLE_CLIENT_EMAIL;
-    if (!clientEmail) {
-      console.log(
-        "❌ No client email specified. Be sure to set GOOGLE_CLIENT_EMAIL env variable."
-      );
-      okay = false;
-    }
-
-    let privateKey = process.env.GOOGLE_PRIVATE_KEY;
-    if (!privateKey) {
-      console.log(
-        "❌ No Google API private key specified. Be sure to set GOOGLE_PRIVATE_KEY env variable."
-      );
-      okay = false;
-    }
-
-    if (!fileFolderId || !destFolder) {
-      console.log("❌ Missing required arguments");
-      console.log(
-        "Usage: sync-gdrive <drive_file_folder_id> <dest_path> [options]"
-      );
-      console.log("Use --help for more information");
+    // Validate required arguments
+    if (!fromPath) {
+      console.error("❌ Error: --from is required");
+      console.log("💡 Use --help to see usage examples");
       process.exit(1);
     }
 
-    if (!okay) {
+    if (!toPath) {
+      console.error("❌ Error: --to is required");
+      console.log("💡 Use --help to see usage examples");
       process.exit(1);
     }
 
-    // Unescape new lines
-    privateKey = privateKey.replace(/\\n/g, "\n");
+    // Load service account credentials
+    const keyPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    if (!keyPath) {
+      console.error(
+        "❌ Error: GOOGLE_APPLICATION_CREDENTIALS environment variable not set"
+      );
+      console.log("💡 Point this to your Google service account JSON file");
+      process.exit(1);
+    }
 
+    let keyConfig;
     try {
-      fs.accessSync(destFolder, fs.constants.R_OK | fs.constants.W_OK);
+      const keyData = fs.readFileSync(keyPath, "utf8");
+      keyConfig = JSON.parse(keyData);
     } catch (error) {
-      console.log(
-        `❌ Destination folder '${destFolder}' does not exist or is not writable by current user`
-      );
+      console.error(`❌ Error reading service account file: ${error.message}`);
       process.exit(1);
     }
 
-    const keyConfig: IKeyConfig = {
-      clientEmail: clientEmail,
-      privateKey: privateKey,
-    };
+    // Determine sync direction and validate
+    const isFromGoogleDrive =
+      fromPath.startsWith("gdrive:") ||
+      (/^[a-zA-Z0-9_-]{25,50}$/.test(fromPath) &&
+        !fromPath.includes("/") &&
+        !fromPath.includes("\\"));
+    const isToGoogleDrive =
+      toPath.startsWith("gdrive:") ||
+      (/^[a-zA-Z0-9_-]{25,50}$/.test(toPath) &&
+        !toPath.includes("/") &&
+        !toPath.includes("\\"));
 
-    // Setup progress tracking
-    if (!options.noProgress) {
-      progressBars = createProgressBars();
-      options.progressCallback = updateProgressBar;
+    console.log("🚀 Starting sync-gdrive...\n");
+
+    if (isFromGoogleDrive && !isToGoogleDrive) {
+      console.log(`📥 **Download Mode**: Google Drive → Local`);
+      console.log(`   From: Google Drive folder ${fromPath}`);
+      console.log(`   To:   ${path.resolve(toPath)}`);
+    } else if (!isFromGoogleDrive && isToGoogleDrive) {
+      console.log(`📤 **Upload Mode**: Local → Google Drive`);
+      console.log(`   From: ${path.resolve(fromPath)}`);
+      console.log(`   To:   Google Drive folder ${toPath}`);
+    } else if (isFromGoogleDrive && isToGoogleDrive) {
+      console.error(
+        "❌ Error: Google Drive to Google Drive sync is not yet supported"
+      );
+      process.exit(1);
+    } else {
+      console.error("❌ Error: Local to local sync is not supported");
+      console.log("💡 Use standard file copy tools for local operations");
+      process.exit(1);
     }
-
-    // Show configuration
-    console.log("🚀 Starting Google Drive sync...");
-    console.log(`📁 Source: Google Drive file/folder ID '${fileFolderId}'`);
-    console.log(`💾 Destination: '${destFolder}'`);
 
     if (options.verbose) {
       console.log("\n⚙️  Configuration:");
       console.log(
-        `   Concurrency: ${options.concurrency || 10} parallel downloads`
+        `   Concurrency: ${options.concurrency || 10} parallel operations`
       );
       console.log(`   Batch size: ${options.batchSize || 20} files per batch`);
       console.log(
@@ -325,78 +427,81 @@ async function main() {
       // Show sync mode
       let syncMode = "Smart incremental (compares modification times)";
       if (options.forceDownload) {
-        syncMode = "Force download (re-download all files)";
+        syncMode = isFromGoogleDrive
+          ? "Force download (re-download all files)"
+          : "Force upload (re-upload all files)";
       } else if (options.skipExisting) {
-        syncMode = "Skip existing (no downloading if file exists)";
+        syncMode = "Skip existing (no transfer if file exists)";
       } else if (options.checkSizeAndTime) {
         syncMode = "Enhanced incremental (size + time matching)";
       }
+
       console.log(`   Sync mode: ${syncMode}`);
 
-      console.log(`   Docs export: ${options.docsFileType || "docx"}`);
-      console.log(`   Sheets export: ${options.sheetsFileType || "xlsx"}`);
-      console.log(`   Slides export: ${options.slidesFileType || "pptx"}`);
+      if (!isFromGoogleDrive) {
+        console.log(
+          `   Create folders: ${options.createFolders ? "Yes" : "No"}`
+        );
+        console.log(
+          `   Preserve timestamps: ${options.preserveTimestamps ? "Yes" : "No"}`
+        );
+      }
+
       console.log(
-        `   Progress bars: ${options.noProgress ? "disabled" : "enabled"}`
+        `   File exports: docs→${options.docsFileType}, sheets→${options.sheetsFileType}, slides→${options.slidesFileType}`
       );
     }
 
-    console.log(""); // Add space before progress bars
+    // Set up progress tracking
+    if (options.showProgress) {
+      progressBars = createProgressBars();
+      options.progressCallback = updateProgressBar;
+    }
 
+    console.log("");
+
+    // Start sync
     const startTime = Date.now();
-    const results = await syncGDrive(
-      fileFolderId,
-      destFolder,
-      keyConfig,
-      options
-    );
-    const endTime = Date.now();
-    const duration = (endTime - startTime) / 1000;
+    const results = await syncFromTo(fromPath, toPath, keyConfig, options);
+    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
     // Clean up progress bars
     if (progressBars.multibar) {
       progressBars.multibar.stop();
     }
 
-    console.log(`\n✅ Sync completed successfully!`);
-    console.log(`⏱️  Duration: ${duration.toFixed(2)} seconds`);
+    // Show final summary
+    const downloaded = Array.isArray(results)
+      ? results.filter((r) => r.updated).length
+      : results?.updated
+      ? 1
+      : 0;
+    const skipped = Array.isArray(results)
+      ? results.filter((r) => !r.updated).length
+      : results?.updated
+      ? 0
+      : 1;
+    const total = downloaded + skipped;
 
-    // Enhanced summary with download/skip stats
-    const totalFiles = results?.length || 0;
-    const downloadedFiles = results?.filter((r) => r.updated).length || 0;
-    const skippedFiles = totalFiles - downloadedFiles;
+    console.log("\n✅ Sync completed!");
+    console.log(
+      `   ${isFromGoogleDrive ? "Downloaded" : "Uploaded"}: ${downloaded} files`
+    );
+    console.log(`   Skipped: ${skipped} files`);
+    console.log(`   Total: ${total} files in ${duration}s`);
 
-    console.log(`📊 Files processed: ${totalFiles}`);
-    if (totalFiles > 0) {
-      console.log(`📥 Downloaded: ${downloadedFiles} files`);
-      console.log(`⊘ Skipped: ${skippedFiles} files`);
-    }
-
-    if (options.concurrency && options.concurrency > 1) {
-      console.log(
-        `🚀 Used ${options.concurrency}x parallel downloads for maximum speed`
-      );
-    }
-
-    const avgSpeed = results?.length
-      ? ((results.length / duration) * 60).toFixed(1)
-      : "0";
-    console.log(`📈 Average speed: ${avgSpeed} files/minute`);
-
-    if (skippedFiles > 0 && !options.forceDownload) {
-      console.log(
-        `💡 ${skippedFiles} files were up-to-date and skipped. Use --force-download to re-download all files.`
-      );
+    if (total > 0) {
+      const rate = (total / parseFloat(duration)).toFixed(1);
+      console.log(`   Rate: ${rate} files/sec`);
     }
   } catch (error) {
-    // Clean up progress bars on error
     if (progressBars.multibar) {
       progressBars.multibar.stop();
     }
 
     console.error("\n❌ Sync failed:", error.message);
-    if (options?.verbose) {
-      console.error(error);
+    if (process.env.DEBUG) {
+      console.error(error.stack);
     }
     process.exit(1);
   }

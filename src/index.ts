@@ -671,7 +671,7 @@ async function countTotalFiles(
   return totalFiles;
 }
 
-export { syncGDrive, IKeyConfig, IOptions };
+export { syncGDrive, syncFromTo, IKeyConfig, IOptions };
 export default syncGDrive;
 
 // ref: https://developers.google.com/drive/v3/web/folder
@@ -730,11 +730,25 @@ function updateProgress(
   const remaining = progressState.totalFiles - progressState.completedFiles;
   const eta = remaining > 0 ? Math.round(remaining / speed) : 0;
 
+  // Determine if this is an upload or download operation
+  const isUpload =
+    currentFile &&
+    (result?.reason === "created" ||
+      result?.reason === "updated" ||
+      result?.reason === "new-file" ||
+      result?.reason === "local-newer");
+
   const progress: ProgressInfo = {
-    phase: progressState.totalFiles > 0 ? "downloading" : "scanning",
+    phase:
+      progressState.totalFiles > 0
+        ? isUpload
+          ? "uploading"
+          : "downloading"
+        : "scanning",
     totalFiles: progressState.totalFiles || undefined,
     completedFiles: progressState.completedFiles,
-    downloadedFiles: progressState.downloadedFiles,
+    downloadedFiles: isUpload ? 0 : progressState.downloadedFiles,
+    uploadedFiles: isUpload ? progressState.downloadedFiles : 0,
     skippedFiles: progressState.skippedFiles,
     currentFile,
     speed: `${speed.toFixed(1)} files/sec`,
@@ -756,4 +770,379 @@ function countFilesInResponse(files: any[]): number {
   return files.filter(
     (file) => file.mimeType !== "application/vnd.google-apps.folder"
   ).length;
+}
+
+/**
+ * Check if a path is a Google Drive folder ID or a local filesystem path
+ * Supports both prefixed format (gdrive:1ABC123...) and raw ID format for backwards compatibility
+ */
+function isGoogleDriveId(path: string): boolean {
+  // New prefixed format: gdrive:1ABC123...
+  if (path.startsWith("gdrive:")) {
+    return true;
+  }
+
+  // Backwards compatibility: heuristic detection for raw IDs
+  // Google Drive IDs are typically 25-50 characters of alphanumeric and some special chars
+  // Local paths usually contain slashes or backslashes
+  const driveIdPattern = /^[a-zA-Z0-9_-]{25,50}$/;
+  const hasPathSeparators = path.includes("/") || path.includes("\\");
+
+  return driveIdPattern.test(path) && !hasPathSeparators;
+}
+
+/**
+ * Extract the actual Google Drive ID from a path, handling both prefixed and raw formats
+ */
+function extractGoogleDriveId(path: string): string {
+  if (path.startsWith("gdrive:")) {
+    return path.substring(7); // Remove 'gdrive:' prefix
+  }
+  return path; // Raw ID format
+}
+
+/**
+ * Upload a local file to Google Drive
+ */
+async function uploadFile(
+  drive: Drive,
+  localFilePath: string,
+  parentFolderId: string,
+  options: IOptions = {}
+): Promise<ISyncState> {
+  try {
+    const fileName = path.basename(localFilePath);
+    const stats = await fs.stat(localFilePath);
+
+    if (options.verbose) {
+      options.logger.debug("uploading file: ", localFilePath);
+    }
+
+    // Check if file already exists in Drive
+    const existingFiles = await drive.files.list({
+      q: `name='${fileName}' and '${parentFolderId}' in parents and trashed=false`,
+      fields: "files(id, name, modifiedTime, size)",
+      supportsAllDrives: options.supportsAllDrives,
+    });
+
+    const existingFile = existingFiles.data.files?.[0];
+    let shouldUpload = true;
+    let reason = "new-file";
+
+    if (existingFile) {
+      const localModifiedTime = timeAsSeconds(stats.mtime);
+      const driveModifiedTime = timeAsSeconds(existingFile.modifiedTime);
+
+      if (options.forceDownload) {
+        shouldUpload = true;
+        reason = "force-upload";
+      } else if (options.skipExisting) {
+        shouldUpload = false;
+        reason = "skip-existing";
+      } else if (options.checkSizeAndTime && existingFile.size) {
+        const driveSize = parseInt(existingFile.size);
+        if (
+          stats.size === driveSize &&
+          Math.abs(localModifiedTime - driveModifiedTime) < 1
+        ) {
+          shouldUpload = false;
+          reason = "same-size-and-time";
+        }
+      } else if (localModifiedTime <= driveModifiedTime) {
+        shouldUpload = false;
+        reason = "drive-newer-or-same";
+      } else {
+        reason = "local-newer";
+      }
+    }
+
+    if (!shouldUpload) {
+      if (options.verbose) {
+        options.logger.debug(`skipping upload: ${localFilePath} (${reason})`);
+      }
+      return {
+        file: localFilePath,
+        updated: false,
+        reason,
+      };
+    }
+
+    // Determine MIME type
+    const mimeType = mime.lookup(localFilePath) || "application/octet-stream";
+
+    // Create readable stream
+    const media = {
+      mimeType,
+      body: require("fs").createReadStream(localFilePath),
+    };
+
+    const fileMetadata = {
+      name: fileName,
+      parents: [parentFolderId],
+    };
+
+    let uploadedFile;
+    if (existingFile) {
+      // Update existing file
+      uploadedFile = await drive.files.update({
+        fileId: existingFile.id,
+        media,
+        fields: "id, name, modifiedTime",
+        supportsAllDrives: options.supportsAllDrives,
+      });
+    } else {
+      // Create new file
+      uploadedFile = await drive.files.create({
+        requestBody: fileMetadata,
+        media,
+        fields: "id, name, modifiedTime",
+        supportsAllDrives: options.supportsAllDrives,
+      });
+    }
+
+    if (options.verbose) {
+      options.logger.debug(
+        `uploaded: ${localFilePath} -> ${uploadedFile.data.name}`
+      );
+    }
+
+    return {
+      file: localFilePath,
+      updated: true,
+      reason: existingFile ? "updated" : "created",
+    };
+  } catch (error) {
+    if (options.verbose) {
+      options.logger.error(`failed to upload ${localFilePath}:`, error.message);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Upload a local directory to Google Drive
+ */
+async function uploadDirectory(
+  drive: Drive,
+  localDirPath: string,
+  parentFolderId: string,
+  options: IOptions
+): Promise<ISyncState[]> {
+  const results: ISyncState[] = [];
+
+  try {
+    const entries = await fs.readdir(localDirPath, { withFileTypes: true });
+
+    // Separate files and directories
+    const files = entries.filter((entry) => entry.isFile());
+    const directories = entries.filter((entry) => entry.isDirectory());
+
+    // Process files in parallel batches
+    if (files.length > 0) {
+      const fileProcessor = async (fileEntry) => {
+        const localFilePath = path.join(localDirPath, fileEntry.name);
+        const result = await uploadFile(
+          drive,
+          localFilePath,
+          parentFolderId,
+          options
+        );
+        updateProgress(options, fileEntry.name, result);
+        return result;
+      };
+
+      const fileResults = await processBatch(
+        files,
+        fileProcessor,
+        options.concurrency || 5
+      );
+      results.push(...fileResults);
+    }
+
+    // Process directories
+    for (const dirEntry of directories) {
+      const localSubDirPath = path.join(localDirPath, dirEntry.name);
+
+      // Check if folder exists in Drive
+      const existingFolders = await drive.files.list({
+        q: `name='${dirEntry.name}' and '${parentFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+        fields: "files(id, name)",
+        supportsAllDrives: options.supportsAllDrives,
+      });
+
+      let folderId;
+      if (existingFolders.data.files?.length > 0) {
+        folderId = existingFolders.data.files[0].id;
+        if (options.verbose) {
+          options.logger.debug(`using existing folder: ${dirEntry.name}`);
+        }
+      } else if (options.createFolders !== false) {
+        // Create folder in Drive
+        const folderMetadata = {
+          name: dirEntry.name,
+          mimeType: "application/vnd.google-apps.folder",
+          parents: [parentFolderId],
+        };
+
+        const folder = await drive.files.create({
+          requestBody: folderMetadata,
+          fields: "id, name",
+          supportsAllDrives: options.supportsAllDrives,
+        });
+
+        folderId = folder.data.id;
+        if (options.verbose) {
+          options.logger.debug(`created folder: ${dirEntry.name}`);
+        }
+      } else {
+        if (options.verbose) {
+          options.logger.debug(
+            `skipping folder creation: ${dirEntry.name} (createFolders=false)`
+          );
+        }
+        continue;
+      }
+
+      // Recursively upload subdirectory
+      const subResults = await uploadDirectory(
+        drive,
+        localSubDirPath,
+        folderId,
+        options
+      );
+      results.push(...subResults);
+    }
+  } catch (error) {
+    if (options.verbose) {
+      options.logger.error(
+        `failed to upload directory ${localDirPath}:`,
+        error.message
+      );
+    }
+    throw error;
+  }
+
+  return results;
+}
+
+/**
+ * Main sync function that handles both download and upload based on from/to parameters
+ */
+async function syncFromTo(
+  fromPath: string,
+  toPath: string,
+  keyConfig: IKeyConfig,
+  options?: IOptions
+) {
+  try {
+    // Reset progress tracking for new sync
+    resetProgressState();
+
+    const auth = new google.auth.JWT(
+      keyConfig.clientEmail,
+      null,
+      keyConfig.privateKey,
+      [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive.appdata",
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/drive.metadata",
+        "https://www.googleapis.com/auth/drive.metadata.readonly",
+        "https://www.googleapis.com/auth/drive.photos.readonly",
+        "https://www.googleapis.com/auth/drive.readonly",
+      ],
+      null
+    );
+
+    google.options({ auth });
+    const drive = google.drive("v3");
+    const finalOptions = initIOptions(options);
+
+    // Determine sync direction
+    const fromIsGoogleDrive = isGoogleDriveId(fromPath);
+    const toIsGoogleDrive = isGoogleDriveId(toPath);
+
+    if (fromIsGoogleDrive && !toIsGoogleDrive) {
+      // Download: Google Drive -> Local
+      if (finalOptions.verbose) {
+        finalOptions.logger.debug(
+          `Downloading from Google Drive (${fromPath}) to local (${toPath})`
+        );
+      }
+      const driveId = extractGoogleDriveId(fromPath);
+      return await syncGDrive(driveId, toPath, keyConfig, finalOptions);
+    } else if (!fromIsGoogleDrive && toIsGoogleDrive) {
+      // Upload: Local -> Google Drive
+      if (finalOptions.verbose) {
+        finalOptions.logger.debug(
+          `Uploading from local (${fromPath}) to Google Drive (${toPath})`
+        );
+      }
+
+      // Check if from path exists
+      const stats = await fs.stat(fromPath);
+      const driveId = extractGoogleDriveId(toPath);
+
+      if (stats.isFile()) {
+        // Upload single file
+        return await uploadFile(drive, fromPath, driveId, finalOptions);
+      } else if (stats.isDirectory()) {
+        // Count total files for progress tracking
+        if (finalOptions.progressCallback) {
+          finalOptions.progressCallback({
+            phase: "scanning",
+            completedFiles: 0,
+            errors: 0,
+          });
+          progressState.totalFiles = await countLocalFiles(fromPath);
+        }
+
+        // Upload directory
+        return await uploadDirectory(drive, fromPath, driveId, finalOptions);
+      } else {
+        throw new Error(`Unsupported file type: ${fromPath}`);
+      }
+    } else if (fromIsGoogleDrive && toIsGoogleDrive) {
+      throw new Error("Google Drive to Google Drive sync is not yet supported");
+    } else {
+      throw new Error(
+        "Local to local sync is not supported - use standard file copy tools"
+      );
+    }
+  } catch (error) {
+    log(error);
+    throw error;
+  }
+}
+
+/**
+ * Count total files in a local directory recursively
+ */
+async function countLocalFiles(dirPath: string): Promise<number> {
+  let totalFiles = 0;
+
+  try {
+    const stats = await fs.stat(dirPath);
+    if (stats.isFile()) {
+      return 1;
+    }
+
+    const entries = await fs.readdir(dirPath, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const fullPath = path.join(dirPath, entry.name);
+      if (entry.isFile()) {
+        totalFiles++;
+      } else if (entry.isDirectory()) {
+        totalFiles += await countLocalFiles(fullPath);
+      }
+    }
+  } catch (error) {
+    // Skip directories we can't read
+    if (error.code !== "EACCES" && error.code !== "EPERM") {
+      throw error;
+    }
+  }
+
+  return totalFiles;
 }

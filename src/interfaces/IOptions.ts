@@ -18,10 +18,19 @@ interface IOptions {
   forceDownload?: boolean;
   skipExisting?: boolean;
   checkSizeAndTime?: boolean;
+
+  // Upload/bidirectional sync options
+  createFolders?: boolean;
+  preserveTimestamps?: boolean;
+  conflictResolution?:
+    | "newest-wins"
+    | "local-wins"
+    | "drive-wins"
+    | "skip-conflicts";
 }
 
 interface ProgressInfo {
-  phase: "scanning" | "downloading" | "complete";
+  phase: "scanning" | "downloading" | "uploading" | "complete";
   totalFiles?: number;
   completedFiles: number;
   currentFile?: string;
@@ -32,6 +41,7 @@ interface ProgressInfo {
   errors?: number;
   skippedFiles?: number;
   downloadedFiles?: number;
+  uploadedFiles?: number;
 }
 
 export default IOptions;
