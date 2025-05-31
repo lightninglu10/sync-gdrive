@@ -1,5 +1,5 @@
 {
-  "name": "@lightninglabs/sync-gdrive",
+  "name": "@quantfive/sync-gdrive",
   "version": "2.0.0",
   "description": "Module to synchronise a file or directory in Google Drive with the local file system",
   "main": "dist/index.js",
