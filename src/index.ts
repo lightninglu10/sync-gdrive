@@ -5,7 +5,7 @@ import { google, drive_v3 } from "googleapis";
 import * as mime from "mime-types";
 
 import IKeyConfig from "./interfaces/IKeyConfig";
-import IOptions from "./interfaces/IOptions";
+import IOptions, { ProgressInfo } from "./interfaces/IOptions";
 import ISyncState from "./interfaces/ISyncState";
 
 type Drive = drive_v3.Drive;
@@ -121,21 +121,71 @@ function timeAsSeconds(datetime: string | number | Date): number {
   return timeInMilliseconds / 1000;
 }
 
-/**
- * Checkes to see if the GDrive file is newer than the local file
- *
- * @param file
- * @param path
- */
-async function isGDriveFileNewer(gDriveFile: File, filePath: string) {
+// Progress tracking state
+let progressState = {
+  totalFiles: 0,
+  completedFiles: 0,
+  downloadedFiles: 0,
+  skippedFiles: 0,
+  errors: 0,
+  startTime: Date.now(),
+  lastUpdate: Date.now(),
+};
+
+function resetProgressState() {
+  progressState = {
+    totalFiles: 0,
+    completedFiles: 0,
+    downloadedFiles: 0,
+    skippedFiles: 0,
+    errors: 0,
+    startTime: Date.now(),
+    lastUpdate: Date.now(),
+  };
+}
+
+async function isGDriveFileNewer(
+  gDriveFile: File,
+  filePath: string,
+  options: IOptions
+): Promise<{ shouldDownload: boolean; reason: string }> {
+  // Force download option
+  if (options.forceDownload) {
+    return { shouldDownload: true, reason: "force-download" };
+  }
+
   try {
     const stats = await fs.stat(filePath);
+
+    // Skip existing option
+    if (options.skipExisting) {
+      return { shouldDownload: false, reason: "skip-existing" };
+    }
+
     const fsModifiedTime = timeAsSeconds(stats.mtime);
     const driveModifiedTime = timeAsSeconds(gDriveFile.modifiedTime);
-    return driveModifiedTime > fsModifiedTime;
+
+    // Enhanced checking with size and time
+    if (options.checkSizeAndTime && gDriveFile.size) {
+      const localSize = stats.size;
+      const driveSize = parseInt(gDriveFile.size);
+
+      if (
+        localSize === driveSize &&
+        Math.abs(driveModifiedTime - fsModifiedTime) < 1
+      ) {
+        return { shouldDownload: false, reason: "same-size-and-time" };
+      }
+    }
+
+    if (driveModifiedTime > fsModifiedTime) {
+      return { shouldDownload: true, reason: "drive-newer" };
+    } else {
+      return { shouldDownload: false, reason: "local-newer-or-same" };
+    }
   } catch (err) {
     if (err.code === "ENOENT") {
-      return true;
+      return { shouldDownload: true, reason: "file-not-exists" };
     } else {
       throw err;
     }
@@ -149,7 +199,13 @@ async function downloadFile(
   options: IOptions = {}
 ) {
   const filePath = path.join(destFolder, sanitiseFilename(file.name));
-  if (await isGDriveFileNewer(file, filePath)) {
+  const { shouldDownload, reason } = await isGDriveFileNewer(
+    file,
+    filePath,
+    options
+  );
+
+  if (shouldDownload) {
     if (options.verbose) {
       options.logger.debug("downloading newer: ", filePath);
       options.logger.debug("creating file: ", filePath);
@@ -191,9 +247,22 @@ async function downloadFile(
     });
   }
 
+  if (options.verbose) {
+    const reasonMap = {
+      "skip-existing": "file exists (skip-existing option)",
+      "local-newer-or-same": "local file is newer or same",
+      "same-size-and-time": "file identical (size and time match)",
+      "force-download": "forced download",
+    };
+    options.logger.debug(
+      `skipping: ${filePath} (${reasonMap[reason] || reason})`
+    );
+  }
+
   return {
     file: filePath,
     updated: false,
+    reason,
   };
 }
 
@@ -208,7 +277,13 @@ async function exportFile(
   const name = sanitiseFilename(file.name) + suffix;
   const filePath = path.join(destFolder, name);
 
-  if (await isGDriveFileNewer(file, filePath)) {
+  const { shouldDownload, reason } = await isGDriveFileNewer(
+    file,
+    filePath,
+    options
+  );
+
+  if (shouldDownload) {
     if (options.verbose) {
       options.logger.debug("downloading newer: ", filePath);
       options.logger.debug("exporting to file: ", filePath);
@@ -252,9 +327,22 @@ async function exportFile(
     });
   }
 
+  if (options.verbose) {
+    const reasonMap = {
+      "skip-existing": "file exists (skip-existing option)",
+      "local-newer-or-same": "local file is newer or same",
+      "same-size-and-time": "file identical (size and time match)",
+      "force-download": "forced download",
+    };
+    options.logger.debug(
+      `skipping: ${filePath} (${reasonMap[reason] || reason})`
+    );
+  }
+
   return {
     file: filePath,
     updated: false,
+    reason,
   };
 }
 
@@ -266,96 +354,108 @@ async function downloadContent(
 ) {
   let result;
 
-  let fileMimeType = file.mimeType;
-  if (file.shortcutDetails) {
-    fileMimeType = file.shortcutDetails.targetMimeType;
-  }
+  try {
+    let fileMimeType = file.mimeType;
+    if (file.shortcutDetails) {
+      fileMimeType = file.shortcutDetails.targetMimeType;
+    }
 
-  if (file.mimeType === "application/vnd.google-apps.document") {
-    const exportimeType = mime.lookup(options.docsFileType);
-    if (!exportimeType) {
-      throw new Error(
-        `Unable to resolve mime type for Google Docs export: ${options.docsFileType}`
+    if (file.mimeType === "application/vnd.google-apps.document") {
+      const exportimeType = mime.lookup(options.docsFileType);
+      if (!exportimeType) {
+        throw new Error(
+          `Unable to resolve mime type for Google Docs export: ${options.docsFileType}`
+        );
+      }
+      result = await exportFile(
+        drive,
+        file,
+        path,
+        exportimeType,
+        `.${options.docsFileType}`,
+        options
       );
-    }
-    result = await exportFile(
-      drive,
-      file,
-      path,
-      exportimeType,
-      `.${options.docsFileType}`,
-      options
-    );
-  } else if (fileMimeType === "application/vnd.google-apps.spreadsheet") {
-    const exportimeType = mime.lookup(options.sheetsFileType);
-    if (!exportimeType) {
-      throw new Error(
-        `Unable to resolve mime type for Google Sheets export: ${options.sheetsFileType}`
+    } else if (fileMimeType === "application/vnd.google-apps.spreadsheet") {
+      const exportimeType = mime.lookup(options.sheetsFileType);
+      if (!exportimeType) {
+        throw new Error(
+          `Unable to resolve mime type for Google Sheets export: ${options.sheetsFileType}`
+        );
+      }
+      result = await exportFile(
+        drive,
+        file,
+        path,
+        exportimeType,
+        `.${options.sheetsFileType}`,
+        options
       );
-    }
-    result = await exportFile(
-      drive,
-      file,
-      path,
-      exportimeType,
-      `.${options.sheetsFileType}`,
-      options
-    );
-  } else if (fileMimeType === "application/vnd.google-apps.presentation") {
-    const exportimeType = mime.lookup(options.slidesFileType);
-    if (!exportimeType) {
-      throw new Error(
-        `Unable to resolve mime type for Google Slides export: ${options.slidesFileType}`
+    } else if (fileMimeType === "application/vnd.google-apps.presentation") {
+      const exportimeType = mime.lookup(options.slidesFileType);
+      if (!exportimeType) {
+        throw new Error(
+          `Unable to resolve mime type for Google Slides export: ${options.slidesFileType}`
+        );
+      }
+      result = await exportFile(
+        drive,
+        file,
+        path,
+        exportimeType,
+        `.${options.slidesFileType}`,
+        options
       );
-    }
-    result = await exportFile(
-      drive,
-      file,
-      path,
-      exportimeType,
-      `.${options.slidesFileType}`,
-      options
-    );
-  } else if (fileMimeType === "application/vnd.google-apps.map") {
-    const exportimeType = mime.lookup(options.mapsFileType);
-    if (!exportimeType) {
-      throw new Error(
-        `Unable to resolve mime type for Google Maps export: ${options.mapsFileType}`
+    } else if (fileMimeType === "application/vnd.google-apps.map") {
+      const exportimeType = mime.lookup(options.mapsFileType);
+      if (!exportimeType) {
+        throw new Error(
+          `Unable to resolve mime type for Google Maps export: ${options.mapsFileType}`
+        );
+      }
+      result = await exportFile(
+        drive,
+        file,
+        path,
+        exportimeType,
+        `.${options.mapsFileType}`,
+        options
       );
-    }
-    result = await exportFile(
-      drive,
-      file,
-      path,
-      exportimeType,
-      `.${options.mapsFileType}`,
-      options
-    );
-  } else if (
-    fileMimeType &&
-    fileMimeType.startsWith("application/vnd.google-apps")
-  ) {
-    // eslint-disable-next-line no-console
-    const exportimeType = mime.lookup(options.fallbackGSuiteFileType);
-    if (!exportimeType) {
-      throw new Error(
-        `Unable to resolve mime type for fallback GSuite export: ${options.fallbackGSuiteFileType}`
+    } else if (
+      fileMimeType &&
+      fileMimeType.startsWith("application/vnd.google-apps")
+    ) {
+      // eslint-disable-next-line no-console
+      const exportimeType = mime.lookup(options.fallbackGSuiteFileType);
+      if (!exportimeType) {
+        throw new Error(
+          `Unable to resolve mime type for fallback GSuite export: ${options.fallbackGSuiteFileType}`
+        );
+      }
+      result = await exportFile(
+        drive,
+        file,
+        path,
+        exportimeType,
+        `.${options.fallbackGSuiteFileType}`,
+        options
       );
+    } else {
+      // eslint-disable-next-line no-console
+      result = await downloadFile(drive, file, path, options);
     }
-    result = await exportFile(
-      drive,
-      file,
-      path,
-      exportimeType,
-      `.${options.fallbackGSuiteFileType}`,
-      options
-    );
-  } else {
-    // eslint-disable-next-line no-console
-    result = await downloadFile(drive, file, path, options);
-  }
 
-  return result;
+    // Report successful download
+    updateProgress(options, file.name, result);
+
+    return result;
+  } catch (error) {
+    // Report failed download
+    updateProgress(options, file.name, {
+      updated: false,
+      reason: error.message,
+    });
+    throw error;
+  }
 }
 
 async function visitDirectory(
@@ -476,6 +576,9 @@ async function syncGDrive(
   options?: IOptions
 ) {
   try {
+    // Reset progress tracking for new sync
+    resetProgressState();
+
     const auth = new google.auth.JWT(
       keyConfig.clientEmail,
       null,
@@ -496,15 +599,76 @@ async function syncGDrive(
 
     const drive = google.drive("v3");
 
-    return fetchContents(
-      drive,
-      fileFolderId,
-      destFolder,
-      initIOptions(options)
-    );
+    const finalOptions = initIOptions(options);
+
+    // If progress tracking is enabled, do a quick scan to count total files
+    if (finalOptions.progressCallback) {
+      finalOptions.progressCallback({
+        phase: "scanning",
+        completedFiles: 0,
+        errors: 0,
+      });
+
+      progressState.totalFiles = await countTotalFiles(
+        drive,
+        fileFolderId,
+        finalOptions
+      );
+    }
+
+    return fetchContents(drive, fileFolderId, destFolder, finalOptions);
   } catch (error) {
     log(error);
   }
+}
+
+async function countTotalFiles(
+  drive: Drive,
+  fileId: string,
+  options: IOptions
+): Promise<number> {
+  let totalFiles = 0;
+  let nextPageToken;
+
+  // Check if this is a single file or folder
+  const response = await drive.files.get({
+    fileId: fileId,
+    fields: "id, name, parents, mimeType, createdTime, modifiedTime",
+    supportsAllDrives: options.supportsAllDrives,
+  });
+
+  if (response.data.mimeType !== "application/vnd.google-apps.folder") {
+    return 1; // Single file
+  }
+
+  // Count files in this folder and subfolders
+  do {
+    const listResponse = await drive.files.list({
+      supportsAllDrives: options.supportsAllDrives,
+      includeItemsFromAllDrives: options.includeItemsFromAllDrives,
+      pageToken: nextPageToken,
+      spaces: "drive",
+      fields: "nextPageToken, files(id, name, parents, mimeType)",
+      q: `'${fileId}' in parents`,
+      pageSize: 200,
+    });
+
+    nextPageToken = listResponse.data.nextPageToken;
+    const files = listResponse.data.files || [];
+
+    // Count regular files
+    totalFiles += countFilesInResponse(files);
+
+    // Recursively count files in subfolders
+    const folders = files.filter(
+      (file) => file.mimeType === "application/vnd.google-apps.folder"
+    );
+    for (const folder of folders) {
+      totalFiles += await countTotalFiles(drive, folder.id!, options);
+    }
+  } while (nextPageToken);
+
+  return totalFiles;
 }
 
 export { syncGDrive, IKeyConfig, IOptions };
@@ -542,4 +706,54 @@ async function processBatch<T, R>(
   }
 
   return results;
+}
+
+function updateProgress(
+  options: IOptions,
+  currentFile?: string,
+  result?: { updated: boolean; reason?: string }
+) {
+  if (!options.progressCallback) return;
+
+  if (result) {
+    if (result.updated) {
+      progressState.downloadedFiles++;
+    } else {
+      progressState.skippedFiles++;
+    }
+    progressState.completedFiles++;
+  }
+
+  const now = Date.now();
+  const elapsed = (now - progressState.startTime) / 1000;
+  const speed = progressState.completedFiles / elapsed;
+  const remaining = progressState.totalFiles - progressState.completedFiles;
+  const eta = remaining > 0 ? Math.round(remaining / speed) : 0;
+
+  const progress: ProgressInfo = {
+    phase: progressState.totalFiles > 0 ? "downloading" : "scanning",
+    totalFiles: progressState.totalFiles || undefined,
+    completedFiles: progressState.completedFiles,
+    downloadedFiles: progressState.downloadedFiles,
+    skippedFiles: progressState.skippedFiles,
+    currentFile,
+    speed: `${speed.toFixed(1)} files/sec`,
+    eta:
+      eta > 0
+        ? `${Math.floor(eta / 60)}:${(eta % 60).toString().padStart(2, "0")}`
+        : undefined,
+    errors: progressState.errors,
+  };
+
+  // Throttle updates to every 100ms
+  if (now - progressState.lastUpdate > 100) {
+    options.progressCallback(progress);
+    progressState.lastUpdate = now;
+  }
+}
+
+function countFilesInResponse(files: any[]): number {
+  return files.filter(
+    (file) => file.mimeType !== "application/vnd.google-apps.folder"
+  ).length;
 }

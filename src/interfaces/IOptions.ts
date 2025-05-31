@@ -13,6 +13,26 @@ interface IOptions {
   includeItemsFromAllDrives?: boolean;
   concurrency?: number;
   batchSize?: number;
+  progressCallback?: (progress: ProgressInfo) => void;
+  showProgress?: boolean;
+  forceDownload?: boolean;
+  skipExisting?: boolean;
+  checkSizeAndTime?: boolean;
+}
+
+interface ProgressInfo {
+  phase: "scanning" | "downloading" | "complete";
+  totalFiles?: number;
+  completedFiles: number;
+  currentFile?: string;
+  totalSize?: number;
+  downloadedSize?: number;
+  speed?: string;
+  eta?: string;
+  errors?: number;
+  skippedFiles?: number;
+  downloadedFiles?: number;
 }
 
 export default IOptions;
+export { ProgressInfo };
