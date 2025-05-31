@@ -30,10 +30,11 @@
   "license": "MIT",
   "dependencies": {
     "googleapis": "^134.0.0",
-    "mime": "^4.0.1"
+    "mime-types": "^3.0.1"
   },
   "devDependencies": {
     "@types/chai": "^4.2.21",
+    "@types/mime-types": "^3.0.0",
     "@types/node": "^16.18.96",
     "@typescript-eslint/eslint-plugin": "^7.7.0",
     "@typescript-eslint/parser": "^7.7.0",
