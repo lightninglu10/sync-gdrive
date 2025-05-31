@@ -3,6 +3,7 @@
 import fs from "fs";
 import cliProgress from "cli-progress";
 import { syncGDrive, syncFromTo } from "./";
+import { google } from "googleapis";
 import path from "path";
 
 interface CliOptions {
@@ -23,6 +24,7 @@ interface CliOptions {
   showProgress?: boolean;
   abortOnError?: boolean;
   progressCallback?: (progress: any) => void;
+  testFolder?: boolean;
 }
 
 // Progress bar setup
@@ -169,6 +171,7 @@ UTILITY OPTIONS:
   --verbose              Show detailed operation logs
   --no-progress          Disable progress bars (for scripts)
   --no-abort-on-error    Continue on errors (don't stop)
+  --test-folder          Test Google Drive folder access before syncing
   --help                 Show this help message
 
 AUTHENTICATION:
@@ -201,6 +204,7 @@ function parseArgs() {
     checkSizeAndTime: false,
     createFolders: true,
     preserveTimestamps: false,
+    testFolder: false,
   };
 
   let fromPath = "";
@@ -332,6 +336,10 @@ function parseArgs() {
         options.preserveTimestamps = true;
         break;
 
+      case "--test-folder":
+        options.testFolder = true;
+        break;
+
       default:
         if (arg.startsWith("--")) {
           console.error(`❌ Error: Unknown option: ${arg}`);
@@ -375,7 +383,20 @@ async function main() {
     let keyConfig;
     try {
       const keyData = fs.readFileSync(keyPath, "utf8");
-      keyConfig = JSON.parse(keyData);
+      const rawKeyConfig = JSON.parse(keyData);
+
+      // Map Google service account JSON properties to our interface
+      keyConfig = {
+        clientEmail: rawKeyConfig.client_email,
+        privateKey: rawKeyConfig.private_key,
+      };
+
+      // Validate required fields
+      if (!keyConfig.clientEmail || !keyConfig.privateKey) {
+        throw new Error(
+          "Service account file missing required fields: client_email or private_key"
+        );
+      }
     } catch (error) {
       console.error(`❌ Error reading service account file: ${error.message}`);
       process.exit(1);
@@ -460,6 +481,19 @@ async function main() {
 
     console.log("");
 
+    // Test folder access if requested or if we detect potential issues
+    const targetFolderId = isFromGoogleDrive ? fromPath : toPath;
+    if (options.testFolder && (isFromGoogleDrive || isToGoogleDrive)) {
+      const testResult = await testFolderAccess(targetFolderId, keyConfig);
+      if (!testResult) {
+        console.error(
+          "\n❌ Folder access test failed. Fix the permissions above before syncing."
+        );
+        process.exit(1);
+      }
+      console.log("\n" + "=".repeat(50) + "\n");
+    }
+
     // Start sync
     const startTime = Date.now();
     const results = await syncFromTo(fromPath, toPath, keyConfig, options);
@@ -504,6 +538,123 @@ async function main() {
       console.error(error.stack);
     }
     process.exit(1);
+  }
+}
+
+async function testFolderAccess(
+  folderId: string,
+  keyConfig: any
+): Promise<boolean> {
+  try {
+    console.log("📁 Testing Google Drive folder access...\n");
+
+    // Clean folder ID (remove gdrive: prefix if present)
+    const cleanFolderId = folderId.startsWith("gdrive:")
+      ? folderId.substring(7)
+      : folderId;
+    console.log(`🔍 Testing access to folder: ${cleanFolderId}`);
+    console.log(`🔐 Using service account: ${keyConfig.clientEmail}\n`);
+
+    // Set up authentication
+    const auth = new google.auth.JWT(
+      keyConfig.clientEmail,
+      null,
+      keyConfig.privateKey,
+      [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive.readonly",
+      ],
+      null
+    );
+
+    google.options({ auth });
+    const drive = google.drive("v3");
+
+    // Test 1: Get folder info
+    console.log("📋 Test 1: Get folder information...");
+    const folderInfo = await drive.files.get({
+      fileId: cleanFolderId,
+      fields: "id, name, parents, mimeType, capabilities",
+    });
+
+    console.log(`✅ Folder found: "${folderInfo.data.name}"`);
+    console.log(`   Type: ${folderInfo.data.mimeType}`);
+    console.log(
+      `   Can create files: ${
+        folderInfo.data.capabilities?.canAddChildren || "unknown"
+      }`
+    );
+
+    if (folderInfo.data.mimeType !== "application/vnd.google-apps.folder") {
+      console.warn("⚠️  Warning: This is not a folder, it's a file!");
+      return false;
+    }
+
+    // Test 2: List contents
+    console.log("\n📂 Test 2: List folder contents...");
+    const contents = await drive.files.list({
+      q: `'${cleanFolderId}' in parents`,
+      fields: "files(id, name, mimeType)",
+      pageSize: 5,
+    });
+
+    const files = contents.data.files || [];
+    console.log(`✅ Found ${files.length} items in folder`);
+
+    if (files.length > 0) {
+      console.log("   Sample items:");
+      files.slice(0, 3).forEach((file) => {
+        const type =
+          file.mimeType === "application/vnd.google-apps.folder" ? "📁" : "📄";
+        console.log(`   ${type} ${file.name}`);
+      });
+    }
+
+    // Test 3: Check upload permissions
+    console.log("\n📤 Test 3: Check upload permissions...");
+
+    if (folderInfo.data.capabilities?.canAddChildren === false) {
+      console.warn(
+        "⚠️  Warning: Cannot create files in this folder (read-only access)"
+      );
+      console.log(
+        '💡 Make sure the service account has "Editor" permissions, not just "Viewer"'
+      );
+      return false;
+    } else {
+      console.log("✅ Upload permissions look good");
+    }
+
+    console.log("\n🎉 Folder access test passed!");
+    return true;
+  } catch (error: any) {
+    console.error(`\n❌ Folder access test failed: ${error.message}`);
+
+    if (error.code === 404) {
+      console.log("\n🔧 Possible solutions:");
+      console.log("1. 📝 Share the folder with your service account:");
+      console.log(`   - Go to Google Drive and find the folder`);
+      console.log(`   - Right-click → Share`);
+      console.log(`   - Add: ${keyConfig.clientEmail}`);
+      console.log(`   - Give "Editor" permissions`);
+      console.log("");
+      console.log("2. 🔍 Double-check the folder ID:");
+      console.log(`   - Current ID: ${folderId}`);
+      console.log(
+        `   - Get it from the URL: https://drive.google.com/drive/folders/FOLDER_ID`
+      );
+    } else if (error.code === 403) {
+      console.log("\n🔧 Permission denied. Make sure:");
+      console.log("1. 📝 The folder is shared with your service account");
+      console.log(
+        '2. 🔓 The service account has "Editor" permissions (not just "Viewer")'
+      );
+      console.log(
+        "3. 🌐 Google Drive API is enabled in your Google Cloud project"
+      );
+    }
+
+    return false;
   }
 }
 
