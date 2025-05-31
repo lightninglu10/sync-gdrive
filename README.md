@@ -276,7 +276,7 @@ MIT License - see LICENSE file for details.
 ## 👥 Contributors
 
 - Andre John Mas (Original author)
-- Enhanced with incremental sync, parallel downloads, and CLI improvements
+- lightninglu10 (enhancements) Enhanced with incremental sync, parallel downloads, and CLI improvements
 
 ---
 
