@@ -579,21 +579,48 @@ async function syncGDrive(
     // Reset progress tracking for new sync
     resetProgressState();
 
-    const auth = new google.auth.JWT(
-      keyConfig.clientEmail,
-      null,
-      keyConfig.privateKey,
-      [
-        "https://www.googleapis.com/auth/drive",
-        "https://www.googleapis.com/auth/drive.appdata",
-        "https://www.googleapis.com/auth/drive.file",
-        "https://www.googleapis.com/auth/drive.metadata",
-        "https://www.googleapis.com/auth/drive.metadata.readonly",
-        "https://www.googleapis.com/auth/drive.photos.readonly",
-        "https://www.googleapis.com/auth/drive.readonly",
-      ],
-      null
-    );
+    let auth;
+
+    // Check if OAuth access token is provided
+    if (keyConfig.accessToken) {
+      // Use OAuth2 authentication
+      auth = new google.auth.OAuth2();
+      auth.setCredentials({
+        access_token: keyConfig.accessToken,
+        refresh_token: keyConfig.refreshToken,
+      });
+
+      // Set client credentials if provided for token refresh
+      if (keyConfig.clientId && keyConfig.clientSecret) {
+        auth.setCredentials({
+          access_token: keyConfig.accessToken,
+          refresh_token: keyConfig.refreshToken,
+          client_id: keyConfig.clientId,
+          client_secret: keyConfig.clientSecret,
+        });
+      }
+    } else if (keyConfig.clientEmail && keyConfig.privateKey) {
+      // Use Service Account JWT authentication (existing behavior)
+      auth = new google.auth.JWT(
+        keyConfig.clientEmail,
+        null,
+        keyConfig.privateKey,
+        [
+          "https://www.googleapis.com/auth/drive",
+          "https://www.googleapis.com/auth/drive.appdata",
+          "https://www.googleapis.com/auth/drive.file",
+          "https://www.googleapis.com/auth/drive.metadata",
+          "https://www.googleapis.com/auth/drive.metadata.readonly",
+          "https://www.googleapis.com/auth/drive.photos.readonly",
+          "https://www.googleapis.com/auth/drive.readonly",
+        ],
+        null
+      );
+    } else {
+      throw new Error(
+        "Either OAuth access token or service account credentials must be provided in keyConfig"
+      );
+    }
 
     google.options({ auth });
 
@@ -1038,21 +1065,48 @@ async function syncFromTo(
     // Reset progress tracking for new sync
     resetProgressState();
 
-    const auth = new google.auth.JWT(
-      keyConfig.clientEmail,
-      null,
-      keyConfig.privateKey,
-      [
-        "https://www.googleapis.com/auth/drive",
-        "https://www.googleapis.com/auth/drive.appdata",
-        "https://www.googleapis.com/auth/drive.file",
-        "https://www.googleapis.com/auth/drive.metadata",
-        "https://www.googleapis.com/auth/drive.metadata.readonly",
-        "https://www.googleapis.com/auth/drive.photos.readonly",
-        "https://www.googleapis.com/auth/drive.readonly",
-      ],
-      null
-    );
+    let auth;
+
+    // Check if OAuth access token is provided
+    if (keyConfig.accessToken) {
+      // Use OAuth2 authentication
+      auth = new google.auth.OAuth2();
+      auth.setCredentials({
+        access_token: keyConfig.accessToken,
+        refresh_token: keyConfig.refreshToken,
+      });
+
+      // Set client credentials if provided for token refresh
+      if (keyConfig.clientId && keyConfig.clientSecret) {
+        auth.setCredentials({
+          access_token: keyConfig.accessToken,
+          refresh_token: keyConfig.refreshToken,
+          client_id: keyConfig.clientId,
+          client_secret: keyConfig.clientSecret,
+        });
+      }
+    } else if (keyConfig.clientEmail && keyConfig.privateKey) {
+      // Use Service Account JWT authentication (existing behavior)
+      auth = new google.auth.JWT(
+        keyConfig.clientEmail,
+        null,
+        keyConfig.privateKey,
+        [
+          "https://www.googleapis.com/auth/drive",
+          "https://www.googleapis.com/auth/drive.appdata",
+          "https://www.googleapis.com/auth/drive.file",
+          "https://www.googleapis.com/auth/drive.metadata",
+          "https://www.googleapis.com/auth/drive.metadata.readonly",
+          "https://www.googleapis.com/auth/drive.photos.readonly",
+          "https://www.googleapis.com/auth/drive.readonly",
+        ],
+        null
+      );
+    } else {
+      throw new Error(
+        "Either OAuth access token or service account credentials must be provided in keyConfig"
+      );
+    }
 
     google.options({ auth });
     const drive = google.drive("v3");
